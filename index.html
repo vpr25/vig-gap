@@ -363,6 +363,7 @@
             <option value="americanfootball_ncaaf">NCAA Football</option>
             <option value="basketball_ncaab">NCAA Basketball</option>
             <option value="soccer_epl">EPL Soccer</option>
+            <option value="soccer_fifa_world_cup">FIFA World Cup</option>
             <option value="mma_mixed_martial_arts">MMA</option>
           </select>
         </div>
@@ -955,16 +956,14 @@
   let lastScanResults = [];
 
   function devigBookMarket(outcomes){
-    // outcomes: array of {name, price(american)}. Returns [{name, dec, fair}] for a two-way market.
-    if (!outcomes || outcomes.length !== 2) return null;
+    // outcomes: array of {name, price(american)}. Handles any N-way market (2-way moneyline,
+    // or 3-way soccer with a Draw) via the standard proportional (multiplicative) de-vig.
+    if (!outcomes || outcomes.length < 2) return null;
     const decs = outcomes.map(o=>americanToDecimal(o.price));
-    if (!decs[0] || !decs[1]) return null;
-    const imp0 = 1/decs[0], imp1 = 1/decs[1];
-    const over = imp0+imp1;
-    return [
-      { name: outcomes[0].name, dec: decs[0], fair: imp0/over },
-      { name: outcomes[1].name, dec: decs[1], fair: imp1/over }
-    ];
+    if (decs.some(d=>!d)) return null;
+    const imps = decs.map(d=>1/d);
+    const over = imps.reduce((a,b)=>a+b,0);
+    return outcomes.map((o,i)=>({ name: o.name, dec: decs[i], fair: imps[i]/over }));
   }
 
   async function runScan(){
