@@ -330,6 +330,35 @@
           <div class="hint">Each leg needs Pinnacle's two-way odds so we can de-vig it. If two legs share the same game, tag them the same so the tool can flag correlation risk.</div>
         </div>
 
+        <div style="border-top:1px dashed var(--line);margin-top:16px;padding-top:14px;">
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:var(--text-faint);margin-bottom:10px;">Promo eligibility rules (optional)</div>
+          <div class="field-row">
+            <div class="field">
+              <label>Min odds allowed (American)</label>
+              <input type="text" id="elig-min-odds" placeholder="e.g. -200">
+            </div>
+            <div class="field">
+              <label>Max odds allowed (American)</label>
+              <input type="text" id="elig-max-odds" placeholder="e.g. +400">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label>Min stake required ($)</label>
+              <input type="number" id="elig-min-stake" placeholder="e.g. 5">
+            </div>
+            <div class="field">
+              <label>Max stake allowed ($)</label>
+              <input type="number" id="elig-max-stake" placeholder="e.g. 50">
+            </div>
+          </div>
+          <div class="field" id="elig-min-legs-wrap">
+            <label>Min legs required (parlay only)</label>
+            <input type="number" id="elig-min-legs" placeholder="e.g. 3">
+          </div>
+          <div class="hint">Leave any of these blank if the promo doesn't restrict it. Odds bounds check against the book's base price (before any boost); for parlays, against the combined price.</div>
+        </div>
+
         <div style="margin-top:18px;display:flex;gap:10px;">
           <button class="btn btn-primary" id="calc-btn">Calculate edge</button>
           <button class="btn btn-ghost" id="clear-btn">Clear</button>
@@ -553,6 +582,7 @@
     });
     document.getElementById('pinnacle-inputs').style.display =
       (t === 'deposit' || t === 'parlay') ? 'none' : 'block';
+    document.getElementById('elig-min-legs-wrap').style.display = (t === 'parlay') ? 'block' : 'none';
     if (t === 'parlay' && legCount === 0){ addLeg(); addLeg(); }
   }
   promoTypeSel.addEventListener('change', updatePromoBlocks);
@@ -600,6 +630,7 @@
     let fairProb = null, bookDec = null, baselineEVpct = null;
     let promoEVdollar = null, promoStakeForLog = null, kellyStake = null, extraNote = '';
     let effectiveDec = null, isBonusStake = false, netLossIfLose = null;
+    let numLegs = null;
 
     if (type !== 'deposit' && type !== 'parlay'){
       const pinSide = americanToDecimal(document.getElementById('in-pin-side').value);
@@ -672,6 +703,7 @@
       const isBonus = document.getElementById('parlay-is-bonus').checked;
       const comboDec = americanToDecimal(document.getElementById('parlay-book-combo').value);
       const legRows = document.querySelectorAll('#parlay-legs .leg-row');
+      numLegs = legRows.length;
       let combinedFair = 1, legOk = legRows.length >= 2, tagsSeen = {}, correlated = false;
       legRows.forEach(row=>{
         const id = row.id.split('-')[1];
@@ -705,9 +737,61 @@
     const rc = repeatCheck(tag, event);
     if (rc.count > 0) warnings.push('You\'ve logged '+rc.count+' bet(s) tagged/matching this in the last '+settings.windowDays+' days — consider the other side or a different market to diversify.');
 
+    // ---- promo eligibility rules (optional) ----
+    let recommendedStake = null;
+    const eligNotes = [];
+    if (type !== 'deposit'){
+      const minOddsDec = americanToDecimal(document.getElementById('elig-min-odds').value);
+      const maxOddsDec = americanToDecimal(document.getElementById('elig-max-odds').value);
+      const minStake = document.getElementById('elig-min-stake').value === '' ? null : parseFloat(document.getElementById('elig-min-stake').value);
+      const maxStake = document.getElementById('elig-max-stake').value === '' ? null : parseFloat(document.getElementById('elig-max-stake').value);
+      const minLegs = document.getElementById('elig-min-legs').value === '' ? null : parseInt(document.getElementById('elig-min-legs').value, 10);
+
+      const priceToCheck = bookDec; // base price before any boost, for both single bets and parlay combo
+      if (priceToCheck){
+        // Odds get LONGER (higher decimal) as they get less favored. "Min odds -200" means the
+        // price must be -200 or longer, i.e. decimal >= that threshold's decimal.
+        if (minOddsDec && priceToCheck < minOddsDec){
+          eligNotes.push('This price is shorter than the promo\'s minimum odds requirement — not eligible as entered.');
+        }
+        if (maxOddsDec && priceToCheck > maxOddsDec){
+          eligNotes.push('This price is longer than the promo\'s maximum odds allowance — not eligible as entered.');
+        }
+      }
+      if (type === 'parlay' && minLegs !== null && numLegs !== null && numLegs < minLegs){
+        eligNotes.push('Promo requires at least '+minLegs+' legs — this parlay only has '+numLegs+'.');
+      }
+
+      // Reconcile stake: no-downside bets (bonus, or a boost/parlay staked with a bonus bet) just need
+      // to respect min/max; cash-staked bets (boost, riskfree, parlay-cash) get Kelly reconciled against them.
+      if (promoStakeForLog !== null){
+        if (isBonusStake || type === 'bonus'){
+          recommendedStake = promoStakeForLog;
+          if (maxStake !== null && promoStakeForLog > maxStake){
+            eligNotes.push('Promo caps this at $'+maxStake.toFixed(2)+' (you entered $'+promoStakeForLog.toFixed(2)+') — use the cap.');
+            recommendedStake = maxStake;
+          }
+          if (minStake !== null && promoStakeForLog < minStake){
+            eligNotes.push('Promo requires a minimum stake of $'+minStake.toFixed(2)+' — this is currently under that.');
+          }
+        } else if (kellyStake !== null){
+          recommendedStake = kellyStake;
+          if (maxStake !== null && recommendedStake > maxStake){
+            eligNotes.push('Kelly suggests $'+recommendedStake.toFixed(2)+', but the promo caps stakes at $'+maxStake.toFixed(2)+' — use the cap.');
+            recommendedStake = maxStake;
+          }
+          if (minStake !== null && recommendedStake < minStake){
+            eligNotes.push('Promo requires at least $'+minStake.toFixed(2)+', above Kelly\'s suggestion of $'+kellyStake.toFixed(2)+' — this carries more variance than the edge alone justifies.');
+            recommendedStake = minStake;
+          }
+        }
+      }
+    }
+    warnings.push(...eligNotes);
+
     lastResult = {
       type, event, tag, book, fairProb, bookDec, baselineEVpct, promoEVdollar,
-      stake: promoStakeForLog, warnings, extraNote, kellyStake,
+      stake: promoStakeForLog, warnings, extraNote, kellyStake, recommendedStake,
       effectiveDec, isBonusStake, netLossIfLose
     };
     renderResult();
@@ -740,8 +824,11 @@
     html += '<div class="stat"><div class="k">Baseline mispricing (pre-promo)</div><div class="v '+baseCls+'">'+baseStr+'</div></div>';
     html += '<div class="stat"><div class="k">Promo-adjusted EV</div><div class="v '+evCls+'">'+evDollarStr+'</div></div>';
     html += '<div class="stat"><div class="k">EV as % of stake</div><div class="v">'+evPctOfStake+'</div></div>';
+    if (r.recommendedStake !== null && r.recommendedStake !== undefined){
+      html += '<div class="stat"><div class="k">Recommended stake</div><div class="v pos">'+fmtDollar(r.recommendedStake)+'</div></div>';
+    }
     if (r.kellyStake !== null && r.kellyStake !== undefined){
-      html += '<div class="stat"><div class="k">Suggested cash stake (fractional Kelly)</div><div class="v">'+fmtDollar(r.kellyStake)+'</div></div>';
+      html += '<div class="stat"><div class="k">Kelly alone, before promo caps</div><div class="v">'+fmtDollar(r.kellyStake)+'</div></div>';
     }
 
     // edge meter: baseline vs promo-adjusted, scaled to +/-40% range
