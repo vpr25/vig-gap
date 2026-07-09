@@ -164,11 +164,12 @@
     <div class="brand">
       <div class="brand-mark">VIG<span>//</span>GAP</div>
     </div>
-    <div class="brand-sub">promo ev desk</div>
+    <div class="brand-sub" id="storage-mode-badge">promo ev desk</div>
   </div>
 
   <div class="tabs">
     <button class="tab-btn active" data-tab="evaluate">Evaluate</button>
+    <button class="tab-btn" data-tab="scan">Scan</button>
     <button class="tab-btn" data-tab="log">Log</button>
     <button class="tab-btn" data-tab="portfolio">Portfolio</button>
     <button class="tab-btn" data-tab="settings">Settings</button>
@@ -344,6 +345,57 @@
     </div>
   </div>
 
+  <!-- ===================== SCAN TAB ===================== -->
+  <div class="tab-panel" id="tab-scan">
+    <div class="panel" style="margin-bottom:16px;">
+      <h2>Scan the board</h2>
+      <div class="hint" style="margin-bottom:12px;">
+        Pulls live prices from The Odds API (free key, no card) across every book it covers for a sport, then ranks bets by how far each book's price sits from the no-vig market consensus. This is a consensus proxy, not Pinnacle itself — worth a quick Pinnacle gut-check on your top pick before sizing up.
+      </div>
+      <div class="field-row3">
+        <div class="field">
+          <label>Sport</label>
+          <select id="scan-sport">
+            <option value="americanfootball_nfl">NFL</option>
+            <option value="basketball_nba">NBA</option>
+            <option value="baseball_mlb">MLB</option>
+            <option value="icehockey_nhl">NHL</option>
+            <option value="americanfootball_ncaaf">NCAA Football</option>
+            <option value="basketball_ncaab">NCAA Basketball</option>
+            <option value="soccer_epl">EPL Soccer</option>
+            <option value="mma_mixed_martial_arts">MMA</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Only show this book (optional)</label>
+          <input type="text" id="scan-book-filter" placeholder="e.g. DraftKings">
+        </div>
+        <div class="field">
+          <label>Min. baseline edge to show</label>
+          <input type="number" id="scan-min-edge" placeholder="1" value="1">
+          <div class="hint">In %, e.g. 1 = only show 1%+ mispricings</div>
+        </div>
+      </div>
+      <button class="btn btn-primary" id="scan-run-btn">Run scan</button>
+      <span id="scan-status" class="hint" style="margin-left:10px;"></span>
+    </div>
+
+    <div class="panel" style="margin-bottom:16px;">
+      <h2>Or paste odds data in manually</h2>
+      <div class="hint" style="margin-bottom:10px;">
+        If live fetching gets blocked in this environment, open this URL yourself (in a normal browser tab — not a code call, so it isn't subject to the same restriction) and paste the full JSON response below:
+        <br><span class="mono" style="font-size:11px;word-break:break-all;display:inline-block;margin-top:6px;">https://api.the-odds-api.com/v4/sports/&lt;sport&gt;/odds/?apiKey=YOUR_KEY&amp;regions=us&amp;markets=h2h&amp;oddsFormat=american</span>
+        <br>Swap &lt;sport&gt; for e.g. <span class="mono">basketball_nba</span>, <span class="mono">americanfootball_nfl</span>, etc. — same sport keys as the dropdown above.
+      </div>
+      <textarea id="scan-paste-box" rows="4" style="width:100%;background:var(--panel-raised);border:1px solid var(--line);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:12px;padding:8px;" placeholder="Paste the raw JSON response here"></textarea>
+      <div style="margin-top:8px;"><button class="btn" id="scan-import-btn">Parse &amp; rank pasted data</button></div>
+    </div>
+    <div class="panel">
+      <h2>Ranked opportunities</h2>
+      <div id="scan-results"><div class="empty">No scan run yet. Add your free Odds API key in Settings, then run a scan above.</div></div>
+    </div>
+  </div>
+
   <!-- ===================== LOG TAB ===================== -->
   <div class="tab-panel" id="tab-log">
     <div class="panel">
@@ -372,6 +424,11 @@
     <div class="panel" style="max-width:480px;">
       <h2>Bankroll &amp; Defaults</h2>
       <div class="field">
+        <label>The Odds API key (free, no card — get one at the-odds-api.com)</label>
+        <input type="text" id="set-odds-key" placeholder="paste your key here">
+        <div class="hint">Stored only in your own Claude account storage. Used for the Scan tab. If direct calls are blocked by the browser, Scan automatically retries through a public CORS-unblocking relay — in that case this key does pass through that third-party service. Said clearly in the Scan status line whenever it happens.</div>
+      </div>
+      <div class="field">
         <label>Bankroll ($) — used for Kelly sizing suggestions on cash-staked bets</label>
         <input type="number" id="set-bankroll" placeholder="2000">
       </div>
@@ -399,32 +456,48 @@
 
   const BETS_KEY = 'vig-gap-bets-v1';
   const SETTINGS_KEY = 'vig-gap-settings-v1';
-  const DEFAULT_SETTINGS = { bankroll: 2000, kellyMult: 0.5, convRate: 70, windowDays: 14 };
+  const DEFAULT_SETTINGS = { bankroll: 2000, kellyMult: 0.5, convRate: 70, windowDays: 14, oddsApiKey: '' };
 
   let bets = [];
   let settings = Object.assign({}, DEFAULT_SETTINGS);
   let legCount = 0;
   let lastResult = null; // holds the most recently calculated bet, pending save
 
+  // Runs inside Claude -> use window.storage (account-synced, no live fetch allowed).
+  // Runs standalone (e.g. GitHub Pages) -> window.storage won't exist, fall back to
+  // localStorage (device-local only, but live fetch works normally).
+  const hasClaudeStorage = (typeof window.storage !== 'undefined' && window.storage !== null);
+  const STORAGE_MODE = hasClaudeStorage ? 'claude' : 'local';
+
   // ---------- storage helpers ----------
+  async function storageGet(key){
+    if (hasClaudeStorage){
+      try { const r = await window.storage.get(key, false); return r ? r.value : null; }
+      catch(e){ return null; }
+    }
+    try { return window.localStorage.getItem(key); } catch(e){ return null; }
+  }
+  async function storageSet(key, value){
+    if (hasClaudeStorage){
+      try { await window.storage.set(key, value, false); return true; }
+      catch(e){ console.error('storage.set failed', e); return false; }
+    }
+    try { window.localStorage.setItem(key, value); return true; }
+    catch(e){ console.error('localStorage.setItem failed', e); return false; }
+  }
+
   async function loadAll(){
     try {
-      const r = await window.storage.get(BETS_KEY, false);
-      bets = r && r.value ? JSON.parse(r.value) : [];
+      const v = await storageGet(BETS_KEY);
+      bets = v ? JSON.parse(v) : [];
     } catch(e){ bets = []; }
     try {
-      const r = await window.storage.get(SETTINGS_KEY, false);
-      if (r && r.value) settings = Object.assign({}, DEFAULT_SETTINGS, JSON.parse(r.value));
+      const v = await storageGet(SETTINGS_KEY);
+      if (v) settings = Object.assign({}, DEFAULT_SETTINGS, JSON.parse(v));
     } catch(e){ /* keep defaults */ }
   }
-  async function saveBets(){
-    try { await window.storage.set(BETS_KEY, JSON.stringify(bets), false); }
-    catch(e){ console.error('save bets failed', e); }
-  }
-  async function saveSettings(){
-    try { await window.storage.set(SETTINGS_KEY, JSON.stringify(settings), false); }
-    catch(e){ console.error('save settings failed', e); }
-  }
+  async function saveBets(){ await storageSet(BETS_KEY, JSON.stringify(bets)); }
+  async function saveSettings(){ await storageSet(SETTINGS_KEY, JSON.stringify(settings)); }
 
   // ---------- math ----------
   function americanToDecimal(raw){
@@ -464,6 +537,9 @@
       if (btn.dataset.tab === 'log') renderLog();
       if (btn.dataset.tab === 'portfolio') renderPortfolio();
       if (btn.dataset.tab === 'settings') fillSettingsForm();
+      if (btn.dataset.tab === 'scan' && !settings.oddsApiKey){
+        document.getElementById('scan-status').textContent = 'No API key set yet — add one in Settings first.';
+      }
     });
   });
 
@@ -875,14 +951,222 @@
     return svg;
   }
 
+  // ---------- scan tab ----------
+  let lastScanResults = [];
+
+  function devigBookMarket(outcomes){
+    // outcomes: array of {name, price(american)}. Returns [{name, dec, fair}] for a two-way market.
+    if (!outcomes || outcomes.length !== 2) return null;
+    const decs = outcomes.map(o=>americanToDecimal(o.price));
+    if (!decs[0] || !decs[1]) return null;
+    const imp0 = 1/decs[0], imp1 = 1/decs[1];
+    const over = imp0+imp1;
+    return [
+      { name: outcomes[0].name, dec: decs[0], fair: imp0/over },
+      { name: outcomes[1].name, dec: decs[1], fair: imp1/over }
+    ];
+  }
+
+  async function runScan(){
+    const statusEl = document.getElementById('scan-status');
+    const resultsEl = document.getElementById('scan-results');
+    if (!settings.oddsApiKey){
+      statusEl.textContent = 'No API key set yet — add one in Settings first.';
+      return;
+    }
+    const sport = document.getElementById('scan-sport').value;
+    const bookFilter = document.getElementById('scan-book-filter').value.trim().toLowerCase();
+    const minEdge = (parseFloat(document.getElementById('scan-min-edge').value)||0)/100;
+
+    statusEl.textContent = 'Fetching...';
+    resultsEl.innerHTML = '<div class="empty">Fetching odds…</div>';
+
+    const url = 'https://api.the-odds-api.com/v4/sports/'+encodeURIComponent(sport)+
+      '/odds/?apiKey='+encodeURIComponent(settings.oddsApiKey)+
+      '&regions=us&markets=h2h&oddsFormat=american';
+
+    // The Odds API doesn't appear to allow direct cross-origin browser calls, so we try
+    // a straight fetch first and, if the browser blocks it, fall back through a couple of
+    // CORS-unblocking relays. Falling back means the request (including your API key)
+    // passes through that third-party relay — flagged in the status line if it happens.
+    const attempts = [
+      { name: 'direct', url: url },
+      { name: 'allorigins.win', url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url) },
+      { name: 'codetabs.com', url: 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(url) }
+    ];
+
+    let data = null, resp = null, usedVia = null, errors = [];
+    for (const attempt of attempts){
+      try {
+        statusEl.textContent = 'Trying '+attempt.name+'...';
+        resp = await fetch(attempt.url);
+        usedVia = attempt.name;
+        break;
+      } catch(e){
+        errors.push(attempt.name+': '+(e && e.message ? e.message : 'unknown error'));
+        resp = null;
+      }
+    }
+
+    if (!resp){
+      statusEl.textContent = 'All routes failed — see details below.';
+      resultsEl.innerHTML = '<div class="warn">Every route (direct + fallback relays) was blocked or unreachable:<br>'+errors.join('<br>')+
+        '<br><br>Tell Claude these exact messages and we\'ll dig into another route.</div>';
+      return;
+    }
+
+    if (!resp.ok){
+      const bodyText = await resp.text().catch(()=> '');
+      statusEl.textContent = 'Request failed via '+usedVia+' (HTTP '+resp.status+').';
+      resultsEl.innerHTML = '<div class="warn">'+bodyText.slice(0,300)+
+        '<br><br>Double-check the key in Settings, and that you have quota remaining this month.</div>';
+      return;
+    }
+
+    try {
+      data = await resp.json();
+    } catch(e){
+      statusEl.textContent = 'Got a response via '+usedVia+' but couldn\'t parse it as JSON.';
+      resultsEl.innerHTML = '<div class="warn">The relay may have altered the response. Tell Claude if this keeps happening.</div>';
+      return;
+    }
+
+    const viaNote = usedVia !== 'direct' ? ' (via '+usedVia+' relay — key passed through it)' : '';
+    if (usedVia !== 'direct'){
+      statusEl.textContent = 'Connected via '+usedVia+'...';
+    }
+
+    renderScanFromData(data, bookFilter, minEdge, viaNote, statusEl, resultsEl);
+  }
+
+  function renderScanFromData(data, bookFilter, minEdge, viaNote, statusEl, resultsEl){
+    if (!Array.isArray(data) || !data.length){
+      statusEl.textContent = 'No games returned for this sport right now.'+viaNote;
+      resultsEl.innerHTML = '<div class="empty">No games returned — try another sport or check back closer to game day.</div>';
+      return;
+    }
+
+    // Build consensus fair prob per event/side across all books, then rank each book's price against it.
+    const rows = [];
+    data.forEach(event=>{
+      const books = (event.bookmakers||[]).map(bm=>{
+        const mkt = (bm.markets||[]).find(m=>m.key==='h2h');
+        if (!mkt) return null;
+        const dv = devigBookMarket(mkt.outcomes);
+        if (!dv) return null;
+        return { key: bm.key, title: bm.title, sides: dv };
+      }).filter(Boolean);
+      if (books.length < 2) return; // need at least 2 books to form a consensus
+
+      // consensus fair prob per named side, averaged across books
+      const sums = {}, counts = {};
+      books.forEach(b=>b.sides.forEach(s=>{
+        sums[s.name] = (sums[s.name]||0) + s.fair;
+        counts[s.name] = (counts[s.name]||0) + 1;
+      }));
+      const consensus = {};
+      Object.keys(sums).forEach(name=>{ consensus[name] = sums[name]/counts[name]; });
+
+      books.forEach(b=>{
+        if (bookFilter && !b.title.toLowerCase().includes(bookFilter)) return;
+        b.sides.forEach(s=>{
+          const fair = consensus[s.name];
+          if (fair === undefined) return;
+          const baselineEV = fair * s.dec - 1;
+          if (baselineEV >= minEdge){
+            rows.push({
+              event: (event.away_team||'')+' @ '+(event.home_team||''),
+              commence: event.commence_time,
+              side: s.name,
+              book: b.title,
+              dec: s.dec,
+              american: s.dec>=2 ? '+'+Math.round((s.dec-1)*100) : Math.round(-100/(s.dec-1)),
+              consensusFair: fair,
+              baselineEV: baselineEV
+            });
+          }
+        });
+      });
+    });
+
+    rows.sort((a,b)=>b.baselineEV-a.baselineEV);
+    lastScanResults = rows;
+    statusEl.textContent = rows.length + ' opportunit'+(rows.length===1?'y':'ies')+' found across '+data.length+' games.'+viaNote;
+
+    if (!rows.length){
+      resultsEl.innerHTML = '<div class="empty">Nothing cleared your edge threshold. Try lowering it or picking a different sport.</div>';
+      return;
+    }
+
+    let html = '<table><thead><tr><th>Event</th><th>Side</th><th>Book</th><th>Price</th><th>Consensus fair%</th><th>Baseline edge</th><th></th></tr></thead><tbody>';
+    rows.slice(0, 60).forEach((r,i)=>{
+      html += '<tr>'+
+        '<td class="wide">'+r.event+'</td>'+
+        '<td class="wide">'+r.side+'</td>'+
+        '<td class="wide">'+r.book+'</td>'+
+        '<td>'+r.american+'</td>'+
+        '<td>'+fmtPct(r.consensusFair)+'</td>'+
+        '<td class="'+(r.baselineEV>=0?'pos':'neg')+'">'+fmtPct(r.baselineEV)+'</td>'+
+        '<td><button class="btn btn-small" data-use="'+i+'">Use →</button></td>'+
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    if (rows.length > 60) html += '<div class="hint" style="margin-top:8px;">Showing the top 60 of '+rows.length+'.</div>';
+    resultsEl.innerHTML = html;
+
+    resultsEl.querySelectorAll('[data-use]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        const r = lastScanResults[parseInt(btn.dataset.use,10)];
+        // Jump to Evaluate tab, prefill event/side/book, and use consensus as the "fair odds" reference.
+        document.querySelector('.tab-btn[data-tab="evaluate"]').click();
+        document.getElementById('in-event').value = r.event;
+        document.getElementById('in-tag').value = r.side;
+        document.getElementById('in-book').value = r.book;
+        document.getElementById('in-book-side').value = r.american;
+        // back out an approximate "other side" American price from the consensus fair% so the
+        // devig box reproduces this same consensus fair number (side American already reflects the book).
+        const otherFair = 1 - r.consensusFair;
+        // Solve for a synthetic pinnacle-side decimal equal to the true fair decimal (1/consensusFair),
+        // and a synthetic other-side decimal so the two-way devig reproduces r.consensusFair exactly.
+        const fairDecSide = 1 / r.consensusFair;
+        const fairDecOther = 1 / otherFair;
+        function decToAmerican(dec){
+          return dec >= 2 ? '+'+Math.round((dec-1)*100) : Math.round(-100/(dec-1));
+        }
+        document.getElementById('in-pin-side').value = decToAmerican(fairDecSide);
+        document.getElementById('in-pin-other').value = decToAmerican(fairDecOther);
+        document.getElementById('result-empty').textContent = 'Pulled in from Scan — consensus used as the fair-odds reference. Pick your promo type and fill in the promo terms, then recalculate.';
+      });
+    });
+  }
+
+  document.getElementById('scan-run-btn').addEventListener('click', runScan);
+
+  // ---------- manual import fallback (used when live fetch is blocked in this environment) ----------
+  document.getElementById('scan-import-btn').addEventListener('click', ()=>{
+    const statusEl = document.getElementById('scan-status');
+    const resultsEl = document.getElementById('scan-results');
+    const raw = document.getElementById('scan-paste-box').value.trim();
+    const bookFilter = document.getElementById('scan-book-filter').value.trim().toLowerCase();
+    const minEdge = (parseFloat(document.getElementById('scan-min-edge').value)||0)/100;
+    if (!raw){ statusEl.textContent = 'Paste some JSON first.'; return; }
+    let data;
+    try { data = JSON.parse(raw); }
+    catch(e){ statusEl.textContent = 'That doesn\'t look like valid JSON — copy the full response body and try again.'; return; }
+    renderScanFromData(data, bookFilter, minEdge, ' (from pasted data)', statusEl, resultsEl);
+  });
+
+
   // ---------- settings tab ----------
   function fillSettingsForm(){
+    document.getElementById('set-odds-key').value = settings.oddsApiKey || '';
     document.getElementById('set-bankroll').value = settings.bankroll;
     document.getElementById('set-kelly').value = settings.kellyMult;
     document.getElementById('set-conv').value = settings.convRate;
     document.getElementById('set-window').value = settings.windowDays;
   }
   document.getElementById('save-settings').addEventListener('click', async ()=>{
+    settings.oddsApiKey = document.getElementById('set-odds-key').value.trim();
     settings.bankroll = parseFloat(document.getElementById('set-bankroll').value)||DEFAULT_SETTINGS.bankroll;
     settings.kellyMult = parseFloat(document.getElementById('set-kelly').value)||DEFAULT_SETTINGS.kellyMult;
     settings.convRate = parseFloat(document.getElementById('set-conv').value)||DEFAULT_SETTINGS.convRate;
@@ -898,6 +1182,18 @@
     await loadAll();
     updatePromoBlocks();
     fillSettingsForm();
+
+    const badge = document.getElementById('storage-mode-badge');
+    if (STORAGE_MODE === 'claude'){
+      badge.textContent = 'promo ev desk · synced to your Claude account';
+    } else {
+      badge.textContent = 'promo ev desk · saved locally in this browser';
+      // Standalone (e.g. GitHub Pages): no sandbox blocking fetch, so live Scan should
+      // just work — de-emphasize the paste-in fallback and say so plainly.
+      const scanHint = document.querySelector('#tab-scan .hint');
+      if (scanHint) scanHint.textContent =
+        'Pulls live prices from The Odds API across every book it covers for a sport, then ranks bets by how far each book\'s price sits from the no-vig market consensus. Running standalone, so live fetching should work directly — the paste-in box further down is just a backup if a request ever gets rate-limited.';
+    }
   })();
 
 })();
